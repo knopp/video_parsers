@@ -4,7 +4,6 @@
 
 use std::io::Cursor;
 
-use anyhow::anyhow;
 use bytes::Buf;
 use thiserror::Error;
 
@@ -25,19 +24,17 @@ pub(crate) struct NaluReader<'a> {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum GetByteError {
+pub(crate) enum NaluReaderError {
     #[error("reader ran out of bits")]
     OutOfBits,
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum ReadBitsError {
     #[error("more than 31 ({0}) bits were requested")]
     TooManyBytesRequested(usize),
-    #[error("failed to advance the current byte")]
-    GetByte(#[from] GetByteError),
     #[error("failed to convert read input to target type")]
     ConversionFailed,
+    #[error("invalid stream")]
+    InvalidStream,
+    #[error("value out of bounds: expected {min} - {max}, got {value}")]
+    ValueOutOfBounds { min: i64, max: i64, value: i64 },
 }
 
 impl<'a> NaluReader<'a> {
@@ -52,7 +49,7 @@ impl<'a> NaluReader<'a> {
     }
 
     /// Read a single bit from the stream.
-    pub fn read_bit(&mut self) -> Result<bool, ReadBitsError> {
+    pub fn read_bit(&mut self) -> Result<bool, NaluReaderError> {
         let bit = self.read_bits::<u32>(1)?;
         match bit {
             1 => Ok(true),
@@ -62,9 +59,9 @@ impl<'a> NaluReader<'a> {
     }
 
     /// Read up to 31 bits from the stream.
-    pub fn read_bits<U: TryFrom<u32>>(&mut self, num_bits: usize) -> Result<U, ReadBitsError> {
+    pub fn read_bits<U: TryFrom<u32>>(&mut self, num_bits: usize) -> Result<U, NaluReaderError> {
         if num_bits > 31 {
-            return Err(ReadBitsError::TooManyBytesRequested(num_bits));
+            return Err(NaluReaderError::TooManyBytesRequested(num_bits));
         }
 
         let mut bits_left = num_bits;
@@ -80,11 +77,11 @@ impl<'a> NaluReader<'a> {
         out &= (1 << num_bits) - 1;
         self.num_remaining_bits_in_curr_byte -= bits_left;
 
-        U::try_from(out).map_err(|_| ReadBitsError::ConversionFailed)
+        U::try_from(out).map_err(|_| NaluReaderError::ConversionFailed)
     }
 
     /// Skip `num_bits` bits from the stream.
-    pub fn skip_bits(&mut self, mut num_bits: usize) -> Result<(), ReadBitsError> {
+    pub fn skip_bits(&mut self, mut num_bits: usize) -> Result<(), NaluReaderError> {
         while num_bits > 0 {
             let n = std::cmp::min(num_bits, 31);
             self.read_bits::<u32>(n)?;
@@ -129,7 +126,7 @@ impl<'a> NaluReader<'a> {
         false
     }
 
-    pub fn read_ue<U: TryFrom<u32>>(&mut self) -> anyhow::Result<U> {
+    pub fn read_ue<U: TryFrom<u32>>(&mut self) -> Result<U, NaluReaderError> {
         let mut num_bits = 0;
         let mut bit = self.read_bits::<u32>(1)?;
 
@@ -139,7 +136,7 @@ impl<'a> NaluReader<'a> {
         }
 
         if num_bits > 31 {
-            return Err(anyhow!("Invalid stream"));
+            return Err(NaluReaderError::InvalidStream);
         }
 
         let mut value = (1 << num_bits) - 1;
@@ -149,9 +146,9 @@ impl<'a> NaluReader<'a> {
         if num_bits == 31 {
             rest = self.read_bits::<u32>(num_bits)?;
             if rest == 0 {
-                return U::try_from(value).map_err(|_| anyhow!("Conversion error"));
+                return U::try_from(value).map_err(|_| NaluReaderError::ConversionFailed);
             } else {
-                return Err(anyhow!("Invalid stream"));
+                return Err(NaluReaderError::InvalidStream);
             }
         }
 
@@ -159,60 +156,66 @@ impl<'a> NaluReader<'a> {
             value += self.read_bits::<u32>(num_bits)?;
         }
 
-        U::try_from(value).map_err(|_| anyhow!("Conversion error"))
+        U::try_from(value).map_err(|_| NaluReaderError::ConversionFailed)
     }
 
-    pub fn read_ue_bounded<U: TryFrom<u32>>(&mut self, min: u32, max: u32) -> anyhow::Result<U> {
+    pub fn read_ue_bounded<U: TryFrom<u32>>(
+        &mut self,
+        min: u32,
+        max: u32,
+    ) -> Result<U, NaluReaderError> {
         let ue = self.read_ue()?;
         if ue > max || ue < min {
-            Err(anyhow!(
-                "Value out of bounds: expected {} - {}, got {}",
-                min,
-                max,
-                ue
-            ))
+            Err(NaluReaderError::ValueOutOfBounds {
+                min: min as i64,
+                max: max as i64,
+                value: ue as i64,
+            })
         } else {
-            Ok(U::try_from(ue).map_err(|_| anyhow!("Conversion error"))?)
+            Ok(U::try_from(ue).map_err(|_| NaluReaderError::ConversionFailed)?)
         }
     }
 
-    pub fn read_ue_max<U: TryFrom<u32>>(&mut self, max: u32) -> anyhow::Result<U> {
+    pub fn read_ue_max<U: TryFrom<u32>>(&mut self, max: u32) -> Result<U, NaluReaderError> {
         self.read_ue_bounded(0, max)
     }
 
-    pub fn read_se<U: TryFrom<i32>>(&mut self) -> anyhow::Result<U> {
+    pub fn read_se<U: TryFrom<i32>>(&mut self) -> Result<U, NaluReaderError> {
         let ue = self.read_ue::<u32>()? as i32;
 
         if ue % 2 == 0 {
-            Ok(U::try_from(-ue / 2).map_err(|_| anyhow!("Conversion error"))?)
+            Ok(U::try_from(-ue / 2).map_err(|_| NaluReaderError::ConversionFailed)?)
         } else {
-            Ok(U::try_from(ue / 2 + 1).map_err(|_| anyhow!("Conversion error"))?)
+            Ok(U::try_from(ue / 2 + 1).map_err(|_| NaluReaderError::ConversionFailed)?)
         }
     }
 
-    pub fn read_se_bounded<U: TryFrom<i32>>(&mut self, min: i32, max: i32) -> anyhow::Result<U> {
+    pub fn read_se_bounded<U: TryFrom<i32>>(
+        &mut self,
+        min: i32,
+        max: i32,
+    ) -> Result<U, NaluReaderError> {
         let se = self.read_se()?;
         if se < min || se > max {
-            Err(anyhow!(
-                "Value out of bounds, expected between {}-{}, got {}",
-                min,
-                max,
-                se
-            ))
+            Err(NaluReaderError::ValueOutOfBounds {
+                min: min as i64,
+                max: max as i64,
+                value: se as i64,
+            })
         } else {
-            Ok(U::try_from(se).map_err(|_| anyhow!("Conversion error"))?)
+            Ok(U::try_from(se).map_err(|_| NaluReaderError::ConversionFailed)?)
         }
     }
 
-    fn get_byte(&mut self) -> Result<u8, GetByteError> {
+    fn get_byte(&mut self) -> Result<u8, NaluReaderError> {
         if self.data.remaining() == 0 {
-            return Err(GetByteError::OutOfBits);
+            return Err(NaluReaderError::OutOfBits);
         }
 
         Ok(self.data.get_u8())
     }
 
-    fn update_curr_byte(&mut self) -> Result<(), GetByteError> {
+    fn update_curr_byte(&mut self) -> Result<(), NaluReaderError> {
         let mut byte = self.get_byte()?;
 
         if (self.prev_two_bytes & 0xffff) == 0 && byte == 0x03 {

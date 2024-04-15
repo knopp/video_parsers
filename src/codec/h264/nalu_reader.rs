@@ -24,7 +24,7 @@ pub(crate) struct NaluReader<'a> {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum NaluReaderError {
+pub enum NaluReaderError {
     #[error("reader ran out of bits")]
     OutOfBits,
     #[error("more than 31 ({0}) bits were requested")]

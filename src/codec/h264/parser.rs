@@ -9,14 +9,14 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::rc::Rc;
 
-use anyhow::anyhow;
-use anyhow::Context;
 use bytes::Buf;
 use enumn::N;
+use thiserror::Error;
 
 use crate::codec::h264::nalu;
 use crate::codec::h264::nalu::Header;
 use crate::codec::h264::nalu_reader::NaluReader;
+use crate::codec::h264::nalu_reader::NaluReaderError;
 use crate::codec::h264::picture::Field;
 
 pub type Nalu<'a> = nalu::Nalu<'a, NaluHeader>;
@@ -1563,6 +1563,35 @@ impl PpsBuilder {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum ParserError {
+    #[error("NaluReaderError: {0}")]
+    NaluReaderError(#[from] NaluReaderError),
+    #[error("non-compliant stream: {0}")]
+    NonCompliantStream(&'static str),
+    #[error("broken stream: {0}")]
+    BrokenStream(&'static str),
+    #[error("invalid NALU type: expected one of {expected:?}, actual {actual:?}")]
+    InvalidNaluType {
+        expected: &'static [NaluType],
+        actual: NaluType,
+    },
+    #[error("invalid frame crop width")]
+    InvalidFrameCropWidth,
+    #[error("invalid frame crop height")]
+    InvalidFrameCropHeight,
+    #[error("unsupported level: {0}")]
+    UnsupportedLevel(u8),
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(&'static str),
+    #[error("invalid slice type: {0}")]
+    InvalidSliceType(u8),
+    #[error("no more data")]
+    NoMoreData,
+}
+
+pub type ParserResult<T> = Result<T, ParserError>;
+
 #[derive(Debug, Default)]
 pub struct Parser {
     active_spses: BTreeMap<u8, Rc<Sps>>,
@@ -1648,7 +1677,7 @@ impl Parser {
         r: &mut NaluReader,
         scaling_list: &mut U,
         use_default: &mut bool,
-    ) -> anyhow::Result<()> {
+    ) -> ParserResult<()> {
         // 7.3.2.1.1.1
         let mut last_scale = 8u8;
         let mut next_scale = 8u8;
@@ -1675,7 +1704,7 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_sps_scaling_lists(r: &mut NaluReader, sps: &mut Sps) -> anyhow::Result<()> {
+    fn parse_sps_scaling_lists(r: &mut NaluReader, sps: &mut Sps) -> ParserResult<()> {
         let scaling_lists4x4 = &mut sps.scaling_lists_4x4;
         let scaling_lisst8x8 = &mut sps.scaling_lists_8x8;
 
@@ -1723,7 +1752,7 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_pps_scaling_lists(r: &mut NaluReader, pps: &mut Pps, sps: &Sps) -> anyhow::Result<()> {
+    fn parse_pps_scaling_lists(r: &mut NaluReader, pps: &mut Pps, sps: &Sps) -> ParserResult<()> {
         let scaling_lists4x4 = &mut pps.scaling_lists_4x4;
         let scaling_lists8x8 = &mut pps.scaling_lists_8x8;
 
@@ -1792,7 +1821,7 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_hrd(r: &mut NaluReader, hrd: &mut HrdParams) -> anyhow::Result<()> {
+    fn parse_hrd(r: &mut NaluReader, hrd: &mut HrdParams) -> ParserResult<()> {
         hrd.cpb_cnt_minus1 = r.read_ue_max(31)?;
         hrd.bit_rate_scale = r.read_bits(4)?;
         hrd.cpb_size_scale = r.read_bits(4)?;
@@ -1810,7 +1839,7 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_vui(r: &mut NaluReader, sps: &mut Sps) -> anyhow::Result<()> {
+    fn parse_vui(r: &mut NaluReader, sps: &mut Sps) -> ParserResult<()> {
         let vui = &mut sps.vui_parameters;
 
         vui.aspect_ratio_info_present_flag = r.read_bit()?;
@@ -1850,15 +1879,17 @@ impl Parser {
             vui.num_units_in_tick = r.read_bits::<u32>(31)? << 1;
             vui.num_units_in_tick |= r.read_bit()? as u32;
             if vui.num_units_in_tick == 0 {
-                return Err(anyhow!(
-                    "num_units_in_tick == 0, which is not allowed by E.2.1"
+                return Err(ParserError::NonCompliantStream(
+                    "num_units_in_tick == 0, which is not allowed by E.2.1",
                 ));
             }
 
             vui.time_scale = r.read_bits::<u32>(31)? << 1;
             vui.time_scale |= r.read_bit()? as u32;
             if vui.time_scale == 0 {
-                return Err(anyhow!("time_scale == 0, which is not allowed by E.2.1"));
+                return Err(ParserError::NonCompliantStream(
+                    "time_scale == 0, which is not allowed by E.2.1",
+                ));
             }
 
             vui.fixed_frame_rate_flag = r.read_bit()?;
@@ -1897,13 +1928,12 @@ impl Parser {
     /// Parse a SPS and add it to the list of active SPSes.
     ///
     /// Returns a reference to the new SPS.
-    pub fn parse_sps(&mut self, nalu: &Nalu) -> anyhow::Result<&Rc<Sps>> {
+    pub fn parse_sps(&mut self, nalu: &Nalu) -> ParserResult<&Rc<Sps>> {
         if !matches!(nalu.header.type_, NaluType::Sps) {
-            return Err(anyhow!(
-                "Invalid NALU type, expected {:?}, got {:?}",
-                NaluType::Sps,
-                nalu.header.type_
-            ));
+            return Err(ParserError::InvalidNaluType {
+                expected: &[NaluType::Sps],
+                actual: nalu.header.type_,
+            });
         }
 
         let data = nalu.as_ref();
@@ -1924,7 +1954,7 @@ impl Parser {
         r.skip_bits(2)?;
 
         let level: u8 = r.read_bits(8)?;
-        sps.level_idc = Level::n(level).with_context(|| format!("Unsupported level {}", level))?;
+        sps.level_idc = Level::n(level).ok_or(ParserError::UnsupportedLevel(level))?;
         sps.seq_parameter_set_id = r.read_ue_max(31)?;
 
         if sps.profile_idc == 100
@@ -2040,13 +2070,13 @@ impl Parser {
                 .checked_sub(
                     (sps.frame_crop_left_offset + sps.frame_crop_right_offset) * crop_unit_x,
                 )
-                .ok_or(anyhow!("Invalid frame crop width"))?;
+                .ok_or(ParserError::InvalidFrameCropWidth)?;
 
             height = height
                 .checked_sub(
                     (sps.frame_crop_top_offset + sps.frame_crop_bottom_offset) * crop_unit_y,
                 )
-                .ok_or(anyhow!("Invalid frame crop height"))?;
+                .ok_or(ParserError::InvalidFrameCropHeight)?;
 
             sps.crop_rect_width = width;
             sps.crop_rect_height = height;
@@ -2058,21 +2088,20 @@ impl Parser {
         self.active_spses.insert(key, Rc::new(sps));
 
         if self.active_spses.keys().len() > MAX_SPS_COUNT as usize {
-            return Err(anyhow!(
-                "Broken data: Number of active SPSs > MAX_SPS_COUNT"
+            return Err(ParserError::BrokenStream(
+                "number of active SPSs > MAX_SPS_COUNT",
             ));
         }
 
         Ok(self.get_sps(key).unwrap())
     }
 
-    pub fn parse_pps(&mut self, nalu: &Nalu) -> anyhow::Result<&Pps> {
+    pub fn parse_pps(&mut self, nalu: &Nalu) -> ParserResult<&Pps> {
         if !matches!(nalu.header.type_, NaluType::Pps) {
-            return Err(anyhow!(
-                "Invalid NALU type, expected {:?}, got {:?}",
-                NaluType::Pps,
-                nalu.header.type_
-            ));
+            return Err(ParserError::InvalidNaluType {
+                expected: &[NaluType::Pps],
+                actual: nalu.header.type_,
+            });
         }
 
         let data = nalu.as_ref();
@@ -2080,9 +2109,11 @@ impl Parser {
         let mut r = NaluReader::new(&data[nalu.header.len()..]);
         let pic_parameter_set_id = r.read_ue_max(MAX_PPS_COUNT as u32 - 1)?;
         let seq_parameter_set_id = r.read_ue_max(MAX_SPS_COUNT as u32 - 1)?;
-        let sps = self.get_sps(seq_parameter_set_id).context(
-            "Broken stream: stream references a SPS that has not been successfully parsed",
-        )?;
+        let sps = self.get_sps(seq_parameter_set_id).ok_or({
+            ParserError::BrokenStream(
+                "stream references a SPS that has not been successfully parsed",
+            )
+        })?;
         let mut pps = Pps {
             pic_parameter_set_id,
             seq_parameter_set_id,
@@ -2112,7 +2143,9 @@ impl Parser {
         pps.num_slice_groups_minus1 = r.read_ue_max(7)?;
 
         if pps.num_slice_groups_minus1 > 0 {
-            return Err(anyhow!("Stream contain unsupported/unimplemented NALs"));
+            return Err(ParserError::UnsupportedFeature(
+                "stream contain unsupported/unimplemented NALs",
+            ));
         }
 
         pps.num_ref_idx_l0_default_active_minus1 = r.read_ue_max(31)?;
@@ -2159,8 +2192,8 @@ impl Parser {
         self.active_ppses.insert(key, Rc::new(pps));
 
         if self.active_ppses.keys().len() > MAX_PPS_COUNT as usize {
-            return Err(anyhow!(
-                "Broken Data: number of active PPSs > MAX_PPS_COUNT"
+            return Err(ParserError::BrokenStream(
+                "number of active PPSs > MAX_PPS_COUNT",
             ));
         }
 
@@ -2171,9 +2204,9 @@ impl Parser {
         r: &mut NaluReader,
         num_ref_idx_active_minus1: u8,
         ref_list_mods: &mut Vec<RefPicListModification>,
-    ) -> anyhow::Result<()> {
+    ) -> ParserResult<()> {
         if num_ref_idx_active_minus1 >= 32 {
-            return Err(anyhow!("Broken Data: num_ref_idx_active_minus1 >= 32"));
+            return Err(ParserError::BrokenStream("num_ref_idx_active_minus1 >= 32"));
         }
 
         loop {
@@ -2196,7 +2229,11 @@ impl Parser {
                     break;
                 }
 
-                _ => return Err(anyhow!("Broken Data: modification_of_pic_nums_idc > 3")),
+                _ => {
+                    return Err(ParserError::BrokenStream(
+                        "modification_of_pic_nums_idc > 3",
+                    ))
+                }
             }
 
             ref_list_mods.push(pic_num_mod);
@@ -2208,7 +2245,7 @@ impl Parser {
     fn parse_ref_pic_list_modifications(
         r: &mut NaluReader,
         header: &mut SliceHeader,
-    ) -> anyhow::Result<()> {
+    ) -> ParserResult<()> {
         if !header.slice_type.is_i() && !header.slice_type.is_si() {
             header.ref_pic_list_modification_flag_l0 = r.read_bit()?;
             if header.ref_pic_list_modification_flag_l0 {
@@ -2238,7 +2275,7 @@ impl Parser {
         r: &mut NaluReader,
         sps: &Sps,
         header: &mut SliceHeader,
-    ) -> anyhow::Result<()> {
+    ) -> ParserResult<()> {
         let pt = &mut header.pred_weight_table;
         pt.luma_log2_weight_denom = r.read_ue_max(7)?;
 
@@ -2329,7 +2366,7 @@ impl Parser {
         r: &mut NaluReader,
         nalu: &Nalu,
         header: &mut SliceHeader,
-    ) -> anyhow::Result<()> {
+    ) -> ParserResult<()> {
         let rpm = &mut header.dec_ref_pic_marking;
 
         if nalu.header.idr_pic_flag {
@@ -2374,7 +2411,7 @@ impl Parser {
         Ok(())
     }
 
-    pub fn parse_slice_header<'a>(&self, nalu: Nalu<'a>) -> anyhow::Result<Slice<'a>> {
+    pub fn parse_slice_header<'a>(&self, nalu: Nalu<'a>) -> ParserResult<Slice<'a>> {
         if !matches!(
             nalu.header.type_,
             NaluType::Slice
@@ -2384,10 +2421,17 @@ impl Parser {
                 | NaluType::SliceIdr
                 | NaluType::SliceExt
         ) {
-            return Err(anyhow!(
-                "Invalid NALU type: {:?} is not a slice NALU",
-                nalu.header.type_
-            ));
+            return Err(ParserError::InvalidNaluType {
+                expected: &[
+                    NaluType::Slice,
+                    NaluType::SliceDpa,
+                    NaluType::SliceDpb,
+                    NaluType::SliceDpc,
+                    NaluType::SliceIdr,
+                    NaluType::SliceExt,
+                ],
+                actual: nalu.header.type_,
+            });
         }
 
         let data = nalu.as_ref();
@@ -2400,14 +2444,16 @@ impl Parser {
         };
 
         let slice_type = r.read_ue_max::<u8>(9)? % 5;
-        header.slice_type = SliceType::n(slice_type)
-            .with_context(|| format!("Invalid slice type {}", slice_type))?;
+        header.slice_type =
+            SliceType::n(slice_type).ok_or(ParserError::InvalidSliceType(slice_type))?;
 
         header.pic_parameter_set_id = r.read_ue()?;
 
-        let pps = self.get_pps(header.pic_parameter_set_id).context(
-            "Broken stream: slice references PPS that has not been successfully parsed.",
-        )?;
+        let pps = self
+            .get_pps(header.pic_parameter_set_id)
+            .ok_or(ParserError::BrokenStream(
+                "slice references PPS that has not been successfully parsed.",
+            ))?;
 
         let sps = &pps.sps;
 
@@ -2476,16 +2522,18 @@ impl Parser {
         if header.field_pic_flag {
             if header.num_ref_idx_l0_active_minus1 > 31 || header.num_ref_idx_l1_active_minus1 > 31
             {
-                return Err(anyhow!("Broken Data"));
+                return Err(ParserError::BrokenStream("num_ref_idx out of range"));
             }
         } else if header.num_ref_idx_l0_active_minus1 > 15
             || header.num_ref_idx_l1_active_minus1 > 15
         {
-            return Err(anyhow!("Broken Data"));
+            return Err(ParserError::BrokenStream("num_ref_idx out of range"));
         }
 
         if let NaluType::SliceExt = nalu.header.type_ {
-            return Err(anyhow!("Stream contain unsupported/unimplemented NALs"));
+            return Err(ParserError::UnsupportedFeature(
+                "stream contain unsupported/unimplemented NALs",
+            ));
         }
 
         Parser::parse_ref_pic_list_modifications(&mut r, &mut header)?;
@@ -2524,7 +2572,9 @@ impl Parser {
         }
 
         if pps.num_slice_groups_minus1 > 0 {
-            return Err(anyhow!("Stream contain unsupported/unimplemented NALs"));
+            return Err(ParserError::UnsupportedFeature(
+                "stream contain unsupported/unimplemented NALs",
+            ));
         }
 
         let epb = r.num_epb();
@@ -2552,17 +2602,20 @@ pub struct NaluHeader {
 }
 
 impl Header for NaluHeader {
-    fn parse<T: AsRef<[u8]>>(cursor: &Cursor<T>) -> anyhow::Result<Self> {
+    fn parse<T: AsRef<[u8]>>(cursor: &Cursor<T>) -> Result<Self, Box<dyn std::error::Error>> {
         if !cursor.has_remaining() {
-            return Err(anyhow!("Broken Data"));
+            return Err(Box::new(ParserError::NoMoreData));
         }
 
         let byte = cursor.chunk()[0];
 
-        let type_ = NaluType::n(byte & 0x1f).ok_or(anyhow!("Broken Data"))?;
+        let type_ =
+            NaluType::n(byte & 0x1f).ok_or(ParserError::BrokenStream("invalid NALU type"))?;
 
         if let NaluType::SliceExt = type_ {
-            return Err(anyhow!("Stream contain unsupported/unimplemented NALs"));
+            return Err(Box::new(ParserError::UnsupportedFeature(
+                "Stream contain unsupported/unimplemented NALs",
+            )));
         }
 
         let ref_idc = (byte & 0x60) >> 5;

@@ -6,13 +6,13 @@ use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io::Cursor;
 
-use anyhow::anyhow;
 use bytes::Buf;
+use thiserror::Error;
 
 #[allow(clippy::len_without_is_empty)]
 pub trait Header: Sized {
     /// Parse the NALU header, returning it.
-    fn parse<T: AsRef<[u8]>>(cursor: &Cursor<T>) -> anyhow::Result<Self>;
+    fn parse<T: AsRef<[u8]>>(cursor: &Cursor<T>) -> Result<Self, Box<dyn std::error::Error>>;
     /// Whether this header type indicates EOS.
     fn is_end(&self) -> bool;
     /// The length of the header.
@@ -30,19 +30,29 @@ pub struct Nalu<'a, U> {
     pub offset: usize,
 }
 
+#[derive(Error, Debug)]
+pub enum NaluError {
+    #[error("no NAL found")]
+    NoNalFound,
+    #[error("failed to parse header")]
+    HeaderParseError(#[from] Box<dyn std::error::Error>),
+    #[error("failed to convert read input to target type")]
+    ConversionFailed,
+}
+
 impl<'a, U> Nalu<'a, U>
 where
     U: Debug + Header,
 {
     /// Find the next Annex B encoded NAL unit.
-    pub fn next(cursor: &mut Cursor<&'a [u8]>) -> anyhow::Result<Nalu<'a, U>> {
+    pub fn next(cursor: &mut Cursor<&'a [u8]>) -> Result<Nalu<'a, U>, NaluError> {
         let bitstream = cursor.clone().into_inner();
-        let pos = usize::try_from(cursor.position())?;
+        let pos = usize::try_from(cursor.position()).map_err(|_| NaluError::ConversionFailed)?;
 
         // Find the start code for this NALU
         let current_nalu_offset = match Nalu::<'a, U>::find_start_code(cursor, pos) {
             Some(offset) => offset,
-            None => return Err(anyhow!("No NAL found")),
+            None => return Err(NaluError::NoNalFound),
         };
 
         let mut start_code_offset = pos + current_nalu_offset;
@@ -57,7 +67,7 @@ where
         let nalu_offset = pos + current_nalu_offset + 3;
 
         // Set the bitstream position to the start of the current NALU
-        cursor.set_position(u64::try_from(nalu_offset)?);
+        cursor.set_position(u64::try_from(nalu_offset).map_err(|_| NaluError::ConversionFailed)?);
 
         let hdr = U::parse(cursor)?;
 

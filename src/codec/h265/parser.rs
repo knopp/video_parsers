@@ -182,7 +182,9 @@ pub struct NaluHeader {
 }
 
 impl Header for NaluHeader {
-    fn parse<T: AsRef<[u8]>>(cursor: &std::io::Cursor<T>) -> anyhow::Result<Self> {
+    fn parse<T: AsRef<[u8]>>(
+        cursor: &std::io::Cursor<T>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let data = &cursor.chunk()[0..2];
         let mut r = BitReader::new(data);
 
